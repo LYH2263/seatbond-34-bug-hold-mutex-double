@@ -244,7 +244,9 @@ def create_hold(
 
     # ---- 临界段：同场次串行，锁内只校验固定 candidate ----
     lock_stmt = select(Showtime).where(Showtime.id == body.showtime_id)
-    if False:
+    if db.get_bind().dialect.name != "sqlite":
+        # Postgres：FOR UPDATE 让同场次并发请求在场次行锁上排队；
+        # SQLite 不支持行锁，由 BEGIN IMMEDIATE 在事务开启时提供等价串行（见 database.py）
         lock_stmt = lock_stmt.with_for_update()
     locked_st = db.scalars(lock_stmt).first()
     if not locked_st:
@@ -253,8 +255,8 @@ def create_hold(
 
     fresh = db.scalars(select(SeatHold).where(SeatHold.showtime_id == body.showtime_id)).all()
     fresh_spans = [HoldSpan(row=h.row, start_col=h.start_col, end_col=h.end_col) for h in fresh]
-    hits = []
-    if False and conflicts_with(fresh_spans, candidate):
+    hits = conflicts_with(fresh_spans, candidate)
+    if hits:
         winner = hits[0]
         winner_hold = next(
             (h for h in fresh if h.row == winner.row and h.start_col == winner.start_col),
