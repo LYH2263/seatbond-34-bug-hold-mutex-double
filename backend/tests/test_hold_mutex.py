@@ -236,3 +236,35 @@ def test_conflicts_page_lists_rejected_request(client, make_showtime):
         rejected["requested_end_col"],
     ) == (1, 1, 4)
     assert rejected["blocking_order_code"]
+
+
+def test_later_search_after_conflict_ignores_loser_sees_winner(client, make_showtime):
+    # 重叠并发后只有成功方落库；后续自动搜索既不能把失败方当占用，也不能漏掉成功方。
+    sid, _ = make_showtime(rows=1, cols=8)
+    results = _run_concurrent(2, sid, party=4, preferred_row=1)
+    codes = [r.status_code for r in results]
+    assert codes.count(200) == 1 and codes.count(409) == 1, codes
+    win = next(r for r in results if r.status_code == 200).json()
+    lose_code = next(r for r in results if r.status_code == 409).json()["detail"]["request_code"]
+    assert (win["row"], win["start_col"], win["end_col"]) == (1, 1, 4)
+
+    # 后续 4 人自动选座：成功方占着 1-4，必须落到 5-8，而不是叠到 1-4
+    follow = _post(client, sid, party=4)
+    assert follow.status_code == 200, follow.text
+    fb = follow.json()
+    assert (fb["row"], fb["start_col"], fb["end_col"]) == (1, 5, 8)
+
+    holds = _holds_for(sid)
+    assert len(holds) == 2  # 不含失败方
+    assert lose_code not in {h.order_code for h in holds}
+
+    # 座位图占用格 = 两条持座区间并集，恰好 8 格，无叠亮、无幽灵格
+    sm = client.get(f"/api/seatmap/{sid}").json()
+    occupied = {(c["row"], c["col"]) for c in sm["cells"] if c["occupied"]}
+    assert occupied == {(1, c) for c in range(1, 9)}
+
+    # 冲突页仍只有失败方那一条，且与持座条数互不串账
+    conflicts = _conflicts_for(sid)
+    assert len(conflicts) == 1
+    assert conflicts[0].request_code == lose_code
+    assert conflicts[0].blocking_order_code == win["order_code"]

@@ -243,8 +243,10 @@ def create_hold(
         )
 
     # ---- 临界段：同场次串行，锁内只校验固定 candidate ----
+    # Postgres：对场次行加 FOR UPDATE，同场次并发请求在该行锁上排队；
+    # SQLite 不支持行锁，临界区会话已以 BEGIN IMMEDIATE 取得库级写锁串行。
     lock_stmt = select(Showtime).where(Showtime.id == body.showtime_id)
-    if False:
+    if db.bind.dialect.name != "sqlite":
         lock_stmt = lock_stmt.with_for_update()
     locked_st = db.scalars(lock_stmt).first()
     if not locked_st:
@@ -253,14 +255,11 @@ def create_hold(
 
     fresh = db.scalars(select(SeatHold).where(SeatHold.showtime_id == body.showtime_id)).all()
     fresh_spans = [HoldSpan(row=h.row, start_col=h.start_col, end_col=h.end_col) for h in fresh]
-    hits = []
-    if False and conflicts_with(fresh_spans, candidate):
+    hits = conflicts_with(fresh_spans, candidate)
+    if hits:
         winner = hits[0]
-        winner_hold = next(
-            (h for h in fresh if h.row == winner.row and h.start_col == winner.start_col),
-            None,
-        )
-        blocking_code = winner_hold.order_code if winner_hold else None
+        winner_hold = fresh[fresh_spans.index(winner)]
+        blocking_code = winner_hold.order_code
         reason = (
             f"座位冲突：请求第{candidate.row}排 {candidate.start_col}-{candidate.end_col} 座，"
             f"已被持座 {blocking_code or '（另一笔请求）'} 占用的"
@@ -306,7 +305,7 @@ def create_hold(
     except Exception:
         # 唯一约束等并发兜底：宁失败不双成功，补写冲突日志
         db.rollback()
-        _log_blocked(
+        blocking_code = _log_blocked(
             showtime_id=body.showtime_id,
             party_size=body.party_size,
             request_code=request_code,
@@ -324,7 +323,7 @@ def create_hold(
                 showtime_id=body.showtime_id,
                 party_size=body.party_size,
                 block=candidate,
-                blocking_order_code=None,
+                blocking_order_code=blocking_code,
             ),
         )
     db.refresh(hold)
@@ -333,22 +332,48 @@ def create_hold(
 
 def _log_blocked(
     *, showtime_id: int, party_size: int, request_code: str, block: HoldSpan
-) -> None:
+) -> str | None:
+    """数据库层并发兜底（如唯一约束冲突）时补写完整冲突日志。
+
+    此时胜出持座已提交，重新开会话查出与 block 重叠的持座，
+    记录其订单号，保证冲突页与锁座页的被拒场次/人数/占用方对得上。
+    返回挡住该请求的订单号（查不到则 None）。
+    """
     from app.database import ImmediateSessionLocal
 
     db = ImmediateSessionLocal()
     try:
+        winners = db.scalars(
+            select(SeatHold).where(SeatHold.showtime_id == showtime_id)
+        ).all()
+        winner = next(
+            (
+                h
+                for h in winners
+                if conflicts_with(
+                    [HoldSpan(row=h.row, start_col=h.start_col, end_col=h.end_col)],
+                    block,
+                )
+            ),
+            None,
+        )
+        blocking_code = winner.order_code if winner else None
         db.add(
             ConflictLog(
                 showtime_id=showtime_id,
                 party_size=party_size,
-                reason=f"并发抢座失败：第{block.row}排 {block.start_col}-{block.end_col} 座已被锁定",
+                reason=(
+                    f"并发抢座失败：第{block.row}排 {block.start_col}-{block.end_col} 座"
+                    f"已被持座 {blocking_code or '（另一笔请求）'} 锁定"
+                ),
                 request_code=request_code,
                 requested_row=block.row,
                 requested_start_col=block.start_col,
                 requested_end_col=block.end_col,
+                blocking_order_code=blocking_code,
             )
         )
         db.commit()
+        return blocking_code
     finally:
         db.close()
